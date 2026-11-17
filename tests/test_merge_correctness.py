@@ -1,0 +1,49 @@
+"""
+Formal correctness tests for the merge operation on Ballista (local: the `merge_local` binary runs
+the vendored MergeExec on plain DataFusion in one process). The distributed merge (`dist_ops
+merge`, hash shuffle by chromosome) is tested in test_ballista_distributed_ops.py.
+
+Run: pytest tests/test_merge_correctness.py -v
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from tests.merge_oracle import reference_merge_intervals
+
+INTERVALS_A = [
+    ("chr1", 100, 200, "gene_A1"),
+    ("chr1", 150, 300, "gene_A2"),
+    ("chr1", 400, 500, "gene_A3"),
+    ("chr2", 50, 150, "gene_A4"),
+    ("chr2", 200, 350, "gene_A5"),
+]
+
+BALLISTA_DIR = Path(__file__).resolve().parent.parent
+MERGE_BINARY = BALLISTA_DIR / "target" / "debug" / "merge_local"
+MERGE_OUTPUT_CSV = BALLISTA_DIR / "output" / "merge_local_result.csv"
+
+
+@pytest.mark.skipif(
+    not MERGE_BINARY.exists(),
+    reason="merge_local is not built - CARGO_BUILD_JOBS=1 cargo build --bin merge_local",
+)
+def test_ballista_local_merge_matches_oracle():
+    result = subprocess.run(
+        [str(MERGE_BINARY)], cwd=BALLISTA_DIR, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    assert MERGE_OUTPUT_CSV.exists()
+
+    df = pd.read_csv(MERGE_OUTPUT_CSV)
+    actual = set(zip(df["chrom"].tolist(), df["start"].tolist(), df["end"].tolist()))
+    expected = reference_merge_intervals(INTERVALS_A)
+
+    assert actual == expected, (
+        f"Only in pb.merge(): {expected - actual}\nOnly in Ballista: {actual - expected}"
+    )

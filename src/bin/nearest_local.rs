@@ -1,0 +1,58 @@
+use std::time::Instant;
+
+use datafusion::error::Result;
+use datafusion::prelude::CsvReadOptions;
+use datafusion_bio_function_ranges::create_bio_session;
+
+// The nearest operation at the local level (like merge_local - NearestProvider
+// also builds a custom, private NearestExec directly in scan() and does not
+// delegate through session.sql() - the same distribution boundary as merge, see
+// vendor/PATCH.md).
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    println!("============================================================");
+    println!("  Local run: nearest (local, datafusion-bio-function-ranges)");
+    println!("============================================================\n");
+
+    let ctx = create_bio_session();
+
+    ctx.register_csv("intervals_a", "data/intervals_a.csv", CsvReadOptions::new())
+        .await?;
+    ctx.register_csv("intervals_b", "data/intervals_b.csv", CsvReadOptions::new())
+        .await?;
+
+    let t0 = Instant::now();
+    let df = ctx
+        .sql(
+            // One row per row of the RIGHT table -> A as the right one, so the result
+            // matches pb.nearest(A, B) (see runner.rs, DistOp::Nearest).
+            "SELECT * FROM nearest('intervals_b', 'intervals_a', 1, true, true, \
+                                    'chrom', 'start', 'end', 'strict') \
+             ORDER BY right_chrom, right_start",
+        )
+        .await?;
+    let result = df.collect().await?;
+    let elapsed = t0.elapsed();
+
+    println!("Time: {:.4}s", elapsed.as_secs_f64());
+    for batch in &result {
+        println!(
+            "{}",
+            datafusion::arrow::util::pretty::pretty_format_batches(&[batch.clone()])?
+        );
+    }
+
+    std::fs::create_dir_all("output")?;
+    let out_file = std::fs::File::create("output/nearest_local_result.csv")?;
+    let mut writer = datafusion::arrow::csv::WriterBuilder::new()
+        .with_header(true)
+        .build(out_file);
+    for batch in &result {
+        writer.write(batch)?;
+    }
+    println!("Result written to output/nearest_local_result.csv");
+    println!("============================================================");
+
+    Ok(())
+}
