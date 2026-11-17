@@ -1,0 +1,194 @@
+//! Binary encoding primitives shared by all codecs of this crate.
+//!
+//! Conventions (the same ones `physical_codec.rs` already used):
+//! - little-endian numbers,
+//! - byte sequences and strings prefixed with their `u32` length,
+//! - a bool as a single 0/1 byte.
+//!
+//! The format does not need versioning: the client, scheduler and executor come from the
+//! same process and the same binary (Ballista standalone), so a payload lives for
+//! exactly one session.
+
+use datafusion::common::{DataFusionError, Result};
+
+pub fn write_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+pub fn read_u32(buf: &[u8], pos: &mut usize) -> Result<u32> {
+    let bytes = buf
+        .get(*pos..*pos + 4)
+        .ok_or_else(|| DataFusionError::Internal("codec_io: truncated buffer (u32)".into()))?;
+    *pos += 4;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+pub fn write_i64(buf: &mut Vec<u8>, v: i64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+pub fn read_i64(buf: &[u8], pos: &mut usize) -> Result<i64> {
+    let bytes = buf
+        .get(*pos..*pos + 8)
+        .ok_or_else(|| DataFusionError::Internal("codec_io: truncated buffer (i64)".into()))?;
+    *pos += 8;
+    Ok(i64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+pub fn write_bool(buf: &mut Vec<u8>, v: bool) {
+    buf.push(v as u8);
+}
+
+pub fn read_bool(buf: &[u8], pos: &mut usize) -> Result<bool> {
+    let b = *buf
+        .get(*pos)
+        .ok_or_else(|| DataFusionError::Internal("codec_io: truncated buffer (bool)".into()))?;
+    *pos += 1;
+    Ok(b != 0)
+}
+
+pub fn write_u8(buf: &mut Vec<u8>, v: u8) {
+    buf.push(v);
+}
+
+pub fn read_u8(buf: &[u8], pos: &mut usize) -> Result<u8> {
+    let b = *buf
+        .get(*pos)
+        .ok_or_else(|| DataFusionError::Internal("codec_io: truncated buffer (u8)".into()))?;
+    *pos += 1;
+    Ok(b)
+}
+
+pub fn write_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    write_u32(buf, bytes.len() as u32);
+    buf.extend_from_slice(bytes);
+}
+
+pub fn read_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
+    let len = read_u32(buf, pos)? as usize;
+    let slice = buf
+        .get(*pos..*pos + len)
+        .ok_or_else(|| DataFusionError::Internal("codec_io: truncated buffer (bytes)".into()))?;
+    *pos += len;
+    Ok(slice)
+}
+
+pub fn write_str(buf: &mut Vec<u8>, s: &str) {
+    write_bytes(buf, s.as_bytes());
+}
+
+pub fn read_str(buf: &[u8], pos: &mut usize) -> Result<String> {
+    let bytes = read_bytes(buf, pos)?;
+    String::from_utf8(bytes.to_vec())
+        .map_err(|e| DataFusionError::Internal(format!("codec_io: invalid UTF-8: {e}")))
+}
+
+/// A triple of column names (contig, start, end) - it recurs in EVERY range operation of
+/// datafusion-bio-function-ranges, hence a separate helper.
+pub fn write_cols(buf: &mut Vec<u8>, c: &(String, String, String)) {
+    write_str(buf, &c.0);
+    write_str(buf, &c.1);
+    write_str(buf, &c.2);
+}
+
+pub fn read_cols(buf: &[u8], pos: &mut usize) -> Result<(String, String, String)> {
+    Ok((
+        read_str(buf, pos)?,
+        read_str(buf, pos)?,
+        read_str(buf, pos)?,
+    ))
+}
+
+/// Checks the MAGIC prefix without advancing the position. Returns `false` also for
+/// buffers shorter than 4 bytes - such a payload is certainly not ours.
+pub fn has_magic(buf: &[u8], magic: u32) -> bool {
+    buf.len() >= 4 && u32::from_le_bytes(buf[0..4].try_into().unwrap()) == magic
+}
+
+pub fn write_magic(buf: &mut Vec<u8>, magic: u32) {
+    buf.extend_from_slice(&magic.to_le_bytes());
+}
+
+// --- Arrow schema ----------------------------------------------------------
+//
+// We ALWAYS serialize the output schema, through the datafusion-proto protobuf.
+// The alternative (reconstructing it on the executor side from the parameters) would mean
+// duplicating the constructor logic of the vendored providers - and that logic differs
+// for each operation and could silently drift apart from it.
+
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion_proto::protobuf;
+use prost::Message;
+use std::sync::Arc;
+
+pub fn write_schema(buf: &mut Vec<u8>, schema: &Schema) -> Result<()> {
+    let proto = protobuf::Schema::try_from(schema)
+        .map_err(|e| DataFusionError::Internal(format!("codec_io: schema -> proto: {e}")))?;
+    write_bytes(buf, &proto.encode_to_vec());
+    Ok(())
+}
+
+pub fn read_schema(buf: &[u8], pos: &mut usize) -> Result<SchemaRef> {
+    let bytes = read_bytes(buf, pos)?;
+    let proto = protobuf::Schema::decode(bytes)
+        .map_err(|e| DataFusionError::Internal(format!("codec_io: proto decode: {e}")))?;
+    let schema = Schema::try_from(&proto)
+        .map_err(|e| DataFusionError::Internal(format!("codec_io: proto -> schema: {e}")))?;
+    Ok(Arc::new(schema))
+}
+
+// --- RecordBatch through Arrow IPC -----------------------------------------
+//
+// Used by the operations with the BROADCAST pattern (nearest, coverage): the left,
+// indexed table travels in full in the physical-plan payload of every
+// task (Ballista 55 encodes the plan separately for each task), and the executor
+// rebuilds the index from it locally.
+//
+// SCALABILITY LIMIT: the plan payload goes through gRPC, and Ballista's default
+// message size limit is 16 MiB (`ballista.client.grpc_max_message_size`,
+// ballista-core/src/config.rs; the scheduler's and executor's gRPC servers likewise).
+// Exceeding this limit in push mode does not end the query with an error: Ballista
+// (53 and 55) treats the executor as lost and retries, so the query hangs. This is the
+// real limitation of this approach and should be reported as such, not
+// worked around.
+// The limit is raised by `BALLISTA_GRPC_MAX_MESSAGE_BYTES` (512 MiB), and exceeding it is
+// detected during planning by `broadcast.rs`.
+
+use datafusion::arrow::compute::concat_batches;
+use datafusion::arrow::error::ArrowError;
+use datafusion::arrow::ipc::reader::StreamReader;
+use datafusion::arrow::ipc::writer::StreamWriter;
+use datafusion::arrow::record_batch::RecordBatch;
+
+fn arrow_err(e: ArrowError) -> DataFusionError {
+    DataFusionError::ArrowError(Box::new(e), None)
+}
+
+/// `StreamWriter` writes the message with the SCHEMA at construction, so even an
+/// empty batch (0 rows) round-trips with the correct schema.
+pub fn write_batch_ipc(buf: &mut Vec<u8>, batch: &RecordBatch) -> Result<()> {
+    let mut w = StreamWriter::try_new(Vec::<u8>::new(), batch.schema_ref()).map_err(arrow_err)?;
+    w.write(batch).map_err(arrow_err)?;
+    w.finish().map_err(arrow_err)?;
+    let bytes = w.into_inner().map_err(arrow_err)?;
+    write_bytes(buf, &bytes);
+    Ok(())
+}
+
+/// The size of a batch encoded as in the plan payload (`write_batch_ipc`), in bytes.
+pub fn ipc_len(batch: &RecordBatch) -> Result<usize> {
+    let mut buf = Vec::new();
+    write_batch_ipc(&mut buf, batch)?;
+    Ok(buf.len())
+}
+
+pub fn read_batch_ipc(buf: &[u8], pos: &mut usize) -> Result<RecordBatch> {
+    let bytes = read_bytes(buf, pos)?;
+    let reader = StreamReader::try_new(std::io::Cursor::new(bytes.to_vec()), None)
+        .map_err(arrow_err)?;
+    let schema = reader.schema();
+    let batches = reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(arrow_err)?;
+    concat_batches(&schema, &batches).map_err(arrow_err)
+}

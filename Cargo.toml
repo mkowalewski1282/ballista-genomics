@@ -1,0 +1,40 @@
+[package]
+name = "ballista_genomics"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+ballista = { version = "55.0.0", features = ["standalone"] }
+# Standalone scheduler and executor processes (the ballista_node binary).
+# These crates are already compiled by `ballista` (standalone feature) with
+# default features, so a direct dependency with the same features does not
+# force a recompilation or an extra download.
+ballista-core = "55.0.0"
+ballista-scheduler = "55.0.0"
+ballista-executor = "55.0.0"
+# Node logs on stderr; version and env-filter feature match ballista-scheduler.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Node log lines with the size of the received broadcast payload; version taken from Cargo.lock.
+tracing = "0.1"
+datafusion = "=55.2.0"
+datafusion-proto = "55"
+# Local copy of datafusion-bio-function-ranges v0.25.0 (DataFusion 55.2; polars-bio 0.37 ships
+# v0.24.0 with the same algorithms - a transitional period) with two visibility patches - see
+# vendor/PATCH.md. Needed by the codecs for the physical nodes of the range operations.
+datafusion-bio-function-ranges = { path = "vendor/datafusion-bio-function-ranges" }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+prost = "0.14"
+# bench_client: streaming consumption of the result (StreamExt); version taken from Cargo.lock.
+futures = "0.3"
+# bench_client: checksum - CRC-32 of the contig; version taken from Cargo.lock
+# (already used by flate2 with the same features, so no dependency rebuild).
+crc32fast = "1.5"
+
+# The development machine has only 3.5GB of RAM - linking these binaries (Ballista
+# scheduler + executor + all of DataFusion + bio-function-ranges) with full debug info
+# (-C debuginfo=2) exhausted swap and risked hanging WSL again. Disabling debug info
+# drastically reduces the linker's (rust-lld) memory use.
+[profile.dev]
+debug = false
